@@ -1,8 +1,10 @@
 #include "vex_graph_index.hpp"
 
 #include <cmath>
+#include <functional>
 #include <set>
 #include <limits>
+#include <unordered_set>
 #include <thread>
 #include <atomic>
 #include <exception>
@@ -352,6 +354,34 @@ static auto RunWithDuckDistancer(VexMetric metric, idx_t dim, Fn &&fn) {
         [&](auto &distancer) -> decltype(auto) {
             return fn(distancer);
         });
+}
+
+using RowFilterFn = GraphIndex::RowFilter;
+
+static bool RowAllowed(const RowFilterFn &filter, row_t rid) {
+    return !filter || filter(rid);
+}
+
+template <typename Store>
+static auto MakeNodeFilter(Store &store, const RowFilterFn &filter, bool has_deleted,
+                           const std::unordered_set<row_t> &deleted_rids) {
+    return [&](uint32 id) -> bool {
+        if (!filter) {
+            return true;
+        }
+        if (id >= store.elems.size()) {
+            return false;
+        }
+        for (const auto &t : store.elems[id].tids) {
+            if (has_deleted && deleted_rids.find(t.row_id) != deleted_rids.end()) {
+                continue;
+            }
+            if (filter(t.row_id)) {
+                return true;
+            }
+        }
+        return false;
+    };
 }
 
 static uint64_t MixCoverage64(uint64_t x) {
@@ -1452,7 +1482,7 @@ void GraphIndex::RebuildPQNodeCodePositions() {
 
 void GraphIndex::SearchPQ(const float *query_vec, idx_t k, int ef,
                           std::vector<row_t> &row_ids, std::vector<float> &distances,
-                          double refine_factor) const {
+                          double refine_factor, const RowFilter &filter) const {
     row_ids.clear();
     distances.clear();
     if (storage_pointer_corruption_ || !pq_use_ || pq_codes_.empty() || !runtime_ || k == 0) {
@@ -1507,6 +1537,9 @@ void GraphIndex::SearchPQ(const float *query_vec, idx_t k, int ef,
             if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
                 continue;
             }
+            if (!RowAllowed(filter, rid)) {
+                continue;
+            }
             const auto *code = pq_codes_.data() + code_position * pq_quantizer_.code_size;
             candidates.emplace_back(
                 distancer.get_distance_single(nullptr, code, 0), rid);
@@ -1532,16 +1565,29 @@ void GraphIndex::SearchPQ(const float *query_vec, idx_t k, int ef,
         const auto search_k = static_cast<uint_fast16_t>(
             std::min<idx_t>(needed, std::numeric_limits<uint_fast16_t>::max()));
         PointExtensionContext point_ctx;
-        auto results = algo.search(point_ctx, reinterpret_cast<const char *>(query), search_k);
-        VtlDestroyGuard results_guard(results);
-
-        candidates.reserve(results.size());
-        for (idx_t i = 0; i < results.size(); i++) {
-            const row_t rid = results[i].tid.row_id;
-            if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
-                continue;
+        auto emit_pq = [&](auto &results) {
+            candidates.reserve(results.size());
+            for (idx_t i = 0; i < results.size(); i++) {
+                const row_t rid = results[i].tid.row_id;
+                if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
+                    continue;
+                }
+                if (!RowAllowed(filter, rid)) {
+                    continue;
+                }
+                candidates.emplace_back(results[i].dist, rid);
             }
-            candidates.emplace_back(results[i].dist, rid);
+        };
+        if (filter) {
+            auto node_filter = MakeNodeFilter(store, filter, has_deleted, deleted_rids_);
+            auto results = algo.search(point_ctx, reinterpret_cast<const char *>(query), search_k,
+                                       node_filter);
+            VtlDestroyGuard results_guard(results);
+            emit_pq(results);
+        } else {
+            auto results = algo.search(point_ctx, reinterpret_cast<const char *>(query), search_k);
+            VtlDestroyGuard results_guard(results);
+            emit_pq(results);
         }
     }
     // PQ commonly gives adjacent vectors the same code distance. Graph walk
@@ -1605,7 +1651,7 @@ void GraphIndex::SearchPQ(const float *query_vec, idx_t k, int ef,
 
 void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
                               std::vector<row_t> &row_ids,
-                              std::vector<float> &distances) const {
+                              std::vector<float> &distances, const RowFilter &filter) const {
     row_ids.clear();
     distances.clear();
     if (storage_pointer_corruption_) {
@@ -1646,6 +1692,9 @@ void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
                 if (has_deleted && deleted_rids_.find(tid.row_id) != deleted_rids_.end()) {
                     continue;
                 }
+                if (!RowAllowed(filter, tid.row_id)) {
+                    continue;
+                }
                 candidates.emplace_back(distance, tid.row_id);
             }
         }
@@ -1677,18 +1726,32 @@ void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
 
         store.search_lock_free_.store(true, std::memory_order_release);
         PointExtensionContext point_ctx;
-        auto results = algo.search(point_ctx, reinterpret_cast<const char *>(query), search_k);
-        VtlDestroyGuard results_guard(results);
-        for (idx_t i = 0; i < results.size() && row_ids.size() < k; i++) {
-            const row_t rid = results[i].tid.row_id;
-            if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
-                continue;
+        auto emit_rq = [&](auto &results) {
+            for (idx_t i = 0; i < results.size() && row_ids.size() < k; i++) {
+                const row_t rid = results[i].tid.row_id;
+                if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
+                    continue;
+                }
+                if (!RowAllowed(filter, rid)) {
+                    continue;
+                }
+                float distance = convert_distance(results[i].dist);
+                // Cosine inputs are normalized before encoding/search, so 1-dot is
+                // already DuckDB's public cosine distance.
+                row_ids.push_back(rid);
+                distances.push_back(distance);
             }
-            float distance = convert_distance(results[i].dist);
-            // Cosine inputs are normalized before encoding/search, so 1-dot is
-            // already DuckDB's public cosine distance.
-            row_ids.push_back(rid);
-            distances.push_back(distance);
+        };
+        if (filter) {
+            auto node_filter = MakeNodeFilter(store, filter, has_deleted, deleted_rids_);
+            auto results = algo.search(point_ctx, reinterpret_cast<const char *>(query), search_k,
+                                       node_filter);
+            VtlDestroyGuard results_guard(results);
+            emit_rq(results);
+        } else {
+            auto results = algo.search(point_ctx, reinterpret_cast<const char *>(query), search_k);
+            VtlDestroyGuard results_guard(results);
+            emit_rq(results);
         }
     };
 
@@ -1774,7 +1837,7 @@ void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
 }
 
 void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
-                           std::vector<float> &distances) const {
+                           std::vector<float> &distances, const RowFilter &filter) const {
     row_ids.clear();
     distances.clear();
     if (storage_pointer_corruption_) {
@@ -1795,6 +1858,9 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
                     query_vec, raw, static_cast<uint16>(dimension_));
                 for (const auto &tid : store.elems[node_id].tids) {
                     if (has_deleted && deleted_rids_.find(tid.row_id) != deleted_rids_.end()) {
+                        continue;
+                    }
+                    if (!RowAllowed(filter, tid.row_id)) {
                         continue;
                     }
                     candidates.emplace_back(distance, tid.row_id);
@@ -1825,15 +1891,29 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
         // Safe only while the shared lock is held; the flag is set under it too.
         store.search_lock_free_.store(true, std::memory_order_release);
         RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, store, [&](auto &algo) {
-            auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
-            VtlDestroyGuard results_guard(res);
-            for (idx_t i = 0; i < res.size() && row_ids.size() < k; i++) {
-                row_t rid = res[i].tid.row_id;
-                if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
-                    continue;
+            auto emit = [&](auto &res) {
+                for (idx_t i = 0; i < res.size() && row_ids.size() < k; i++) {
+                    row_t rid = res[i].tid.row_id;
+                    if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
+                        continue;
+                    }
+                    if (!RowAllowed(filter, rid)) {
+                        continue;
+                    }
+                    row_ids.push_back(rid);
+                    distances.push_back(res[i].dist);
                 }
-                row_ids.push_back(rid);
-                distances.push_back(res[i].dist);
+            };
+            if (filter) {
+                auto node_filter = MakeNodeFilter(store, filter, has_deleted, deleted_rids_);
+                auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k,
+                                       node_filter);
+                VtlDestroyGuard results_guard(res);
+                emit(res);
+            } else {
+                auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
+                VtlDestroyGuard results_guard(res);
+                emit(res);
             }
         });
     };
@@ -1928,6 +2008,61 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
         }
         auto search_k = uint_fast16_t(std::min<idx_t>(needed, std::numeric_limits<uint_fast16_t>::max()));
         do_search(store, search_k, has_deleted);
+    }
+}
+
+void GraphIndex::SearchExactOverRows(const float *query_vec, idx_t k, const std::vector<row_t> &allowed,
+                                     std::vector<row_t> &row_ids, std::vector<float> &distances) const {
+    row_ids.clear();
+    distances.clear();
+    if (storage_pointer_corruption_ || allowed.empty() || k == 0) {
+        return;
+    }
+
+    vex_duck::SharedLockGuard _rg(graph_rwlock_);
+    if (!runtime_) {
+        return;
+    }
+    auto &store = runtime_->store;
+    const bool has_deleted = !deleted_rids_.empty();
+
+    std::vector<float> query_buf;
+    const float *query = query_vec;
+    if (metric_ == VexMetric::COSINE) {
+        query_buf.assign(query_vec, query_vec + dimension_);
+        NormalizeInPlace(query_buf.data(), dimension_);
+        query = query_buf.data();
+    }
+
+    std::vector<std::pair<float, row_t>> candidates;
+    candidates.reserve(allowed.size());
+    RunWithDuckDistancer(metric_, dimension_, [&](auto &distancer) {
+        for (row_t rid : allowed) {
+            if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
+                continue;
+            }
+            auto it = rowid_node_map_.find(rid);
+            if (it == rowid_node_map_.end()) {
+                continue;
+            }
+            const auto *raw = store.get_data(it->second);
+            if (!raw) {
+                continue;
+            }
+            const float distance =
+                distancer.get_distance_single(query, raw, static_cast<uint16>(dimension_));
+            candidates.emplace_back(distance, rid);
+        }
+    });
+    std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
+        return a.first < b.first || (a.first == b.first && a.second < b.second);
+    });
+    const size_t out = std::min<size_t>(k, candidates.size());
+    row_ids.reserve(out);
+    distances.reserve(out);
+    for (size_t i = 0; i < out; i++) {
+        row_ids.push_back(candidates[i].second);
+        distances.push_back(candidates[i].first);
     }
 }
 

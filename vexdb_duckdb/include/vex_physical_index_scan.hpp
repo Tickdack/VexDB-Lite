@@ -16,7 +16,8 @@ public:
                         DuckTableEntry &table, GraphIndex &graph_index,
                         unique_ptr<Expression> query_vec_expr, idx_t k,
                         vector<ColumnIndex> column_ids, vector<idx_t> fetch_output_positions,
-                        optional_idx distance_output_index, vector<LogicalType> returned_types);
+                        optional_idx distance_output_index, vector<LogicalType> returned_types,
+                        vector<unique_ptr<Expression>> filter_exprs = {});
 
     PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
     void ResolveColumnBindings(ColumnBindingResolver &res, vector<ColumnBinding> &bindings) override;
@@ -38,6 +39,9 @@ public:
     vector<idx_t> fetch_output_positions;
     optional_idx distance_output_index;
     vector<LogicalType> returned_types;
+    // Scalar predicates pushed into the index scan for in-filter / pre-filter.
+    // Empty means unfiltered ANN. Bindings are LogicalGet column_ids indices.
+    vector<unique_ptr<Expression>> filter_exprs;
 };
 
 class PhysicalVexIndexScan : public PhysicalOperator {
@@ -49,7 +53,7 @@ public:
 	                     unique_ptr<Expression> query_vec_expr, idx_t k,
 	                     vector<ColumnIndex> column_ids, vector<idx_t> fetch_output_positions,
 	                     optional_idx distance_output_index, vector<LogicalType> returned_types,
-	                     idx_t base_output_count);
+	                     idx_t base_output_count, vector<unique_ptr<Expression>> filter_exprs = {});
 
     string GetName() const override;
     InsertionOrderPreservingMap<string> ParamsToString() const override;
@@ -73,7 +77,8 @@ public:
     vector<idx_t> fetch_output_positions;
     optional_idx distance_output_index;
     vector<LogicalType> returned_types;
-    string algorithm_used;
+    mutable string algorithm_used;
+    vector<unique_ptr<Expression>> filter_exprs;
 };
 
 } // namespace duckdb

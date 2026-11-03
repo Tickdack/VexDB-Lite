@@ -258,11 +258,19 @@ static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
 }
 
 static void ReplaceGetWithVexScan(unique_ptr<LogicalOperator> &get_owner, const GetChildInfo &info,
-                                  unique_ptr<LogicalOperator> vex_scan) {
+                                  unique_ptr<LogicalOperator> vex_scan, bool consume_filter) {
     if (info.proj) {
-        info.proj->children[0] = std::move(vex_scan);
+        if (consume_filter || !info.filter) {
+            info.proj->children[0] = std::move(vex_scan);
+        } else {
+            info.filter->children[0] = std::move(vex_scan);
+        }
     } else if (info.filter) {
-        info.filter->children[0] = std::move(vex_scan);
+        if (consume_filter) {
+            get_owner = std::move(vex_scan);
+        } else {
+            info.filter->children[0] = std::move(vex_scan);
+        }
     } else {
         get_owner = std::move(vex_scan);
     }
@@ -539,9 +547,26 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
         fetch_output_positions.push_back(i);
     }
 
+    // Push simple WHERE predicates into the index scan (in-filter / pre-filter).
+    // Cross-product + subquery query vectors keep the old post-filter path:
+    // the FILTER sits beside a CROSS_PRODUCT child and rewriting it is riskier.
+    vector<unique_ptr<Expression>> pushed_filters;
+    const bool consume_filter = !get_info.filter_inside_cross_product &&
+                                (get_info.filter || !lifted_filter_exprs.empty());
+    if (consume_filter) {
+        if (get_info.filter) {
+            for (auto &expr : get_info.filter->expressions) {
+                pushed_filters.push_back(expr->Copy());
+            }
+        }
+        for (auto &expr : lifted_filter_exprs) {
+            pushed_filters.push_back(std::move(expr));
+        }
+    }
+
     idx_t k_scan = k;
     bool has_lifted_filter = !lifted_filter_exprs.empty();
-    if (get_info.filter || has_lifted_filter) {
+    if (!consume_filter && (get_info.filter || has_lifted_filter)) {
         idx_t get_card = get->has_estimated_cardinality ? get->estimated_cardinality : 0;
         idx_t filter_card = 0;
         if (get_info.filter && get_info.filter->has_estimated_cardinality) {
@@ -553,7 +578,7 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
     auto scan = make_uniq<LogicalVexIndexScan>(get->table_index, GetOutputTypes(get), duck_table, *match.graph_idx,
                                                dist_info.query_vec_expr->Copy(), k_scan, column_ids,
                                                std::move(fetch_output_positions), optional_idx(),
-                                               get->returned_types);
+                                               get->returned_types, std::move(pushed_filters));
     scan->SetEstimatedCardinality(k);
 
     if (get_info.cross_product) {
@@ -561,7 +586,7 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
     }
 
     unique_ptr<LogicalOperator> replacement = std::move(scan);
-    if (has_lifted_filter) {
+    if (!consume_filter && has_lifted_filter) {
         // Reconstruct a LogicalFilter from predicates that DuckDB had pushed into
         // LogicalGet.table_filters. VEXDB_INDEX_SCAN fetches by row_id and doesn't
         // honor table_filters; wrapping with a LogicalFilter restores correctness
@@ -572,7 +597,7 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
         lifted_filter->children.push_back(std::move(replacement));
         replacement = std::move(lifted_filter);
     }
-    ReplaceGetWithVexScan(get_owner, get_info, std::move(replacement));
+    ReplaceGetWithVexScan(get_owner, get_info, std::move(replacement), consume_filter);
     (void)node;
     return true;
 }

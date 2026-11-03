@@ -6,15 +6,26 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Boost REQUIRED)
+# Vendored Boost is header-only and trimmed (no boost/version.hpp / preprocessor),
+# so find_package(Boost) fails on machines without a system Boost. Include the
+# repo's thirdparties/ directory directly — same approach as vexdb_pg — and
+# optionally a local Boost.Preprocessor checkout for the trimmed headers.
+set(VEXDB_BOOST_INC "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparties")
+if(DEFINED ENV{BOOST_INCLUDEDIR} AND NOT "$ENV{BOOST_INCLUDEDIR}" STREQUAL "")
+    set(VEXDB_BOOST_INC "$ENV{BOOST_INCLUDEDIR}")
+endif()
+set(VEXDB_BOOST_PP_INC "${CMAKE_CURRENT_SOURCE_DIR}/../build/boost_preprocessor/include")
 
 include_directories(
     include
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../common
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${Boost_INCLUDE_DIRS}
+    ${VEXDB_BOOST_INC}
 )
+if(EXISTS "${VEXDB_BOOST_PP_INC}/boost/preprocessor/seq.hpp")
+    include_directories(${VEXDB_BOOST_PP_INC})
+endif()
 
 execute_process(
     COMMAND git rev-parse --short HEAD

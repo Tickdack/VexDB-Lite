@@ -70,16 +70,27 @@ public:
     void RebuildBulk(const float *vectors, idx_t vector_count, const std::vector<row_t> &row_ids,
                      bool vectors_are_normalized = false,
                      std::function<void()> release_vector_source = nullptr);
+    // Optional row-id predicate for in-filtering: nodes that fail the predicate
+    // still participate in graph navigation, but are not emitted as results.
+    // Empty filter (default) is a no-op and matches the unfiltered path.
+    using RowFilter = std::function<bool(row_t)>;
+
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
-                   std::vector<float> &distances) const;
+                   std::vector<float> &distances, const RowFilter &filter = {}) const;
     // PQ ADC search over the shared graph topology. The graph keeps query cost
     // bounded by ef instead of scanning every code as the table grows.
     // refine_factor > 1.0 takes top k*factor by PQ distance then re-ranks via
     // raw vector. Ignored in compact_mode_ (no raw vec). 1.0 = no refine.
     void SearchPQ(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
-                  std::vector<float> &distances, double refine_factor = 1.0) const;
+                  std::vector<float> &distances, double refine_factor = 1.0,
+                  const RowFilter &filter = {}) const;
     void SearchRaBitQ(const float *query_vec, idx_t k, int ef,
-                      std::vector<row_t> &row_ids, std::vector<float> &distances) const;
+                      std::vector<row_t> &row_ids, std::vector<float> &distances,
+                      const RowFilter &filter = {}) const;
+    // Pre-filter path: exact distances over a small allowed row-id set.
+    // Used when |D_φ| is small enough that a graph walk is not worth it.
+    void SearchExactOverRows(const float *query_vec, idx_t k, const std::vector<row_t> &allowed,
+                             std::vector<row_t> &row_ids, std::vector<float> &distances) const;
 
     idx_t GetDimension() const {
         return dimension_;

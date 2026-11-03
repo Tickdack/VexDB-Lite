@@ -1,0 +1,97 @@
+name: index__graph_index_filtered_search
+tags:
+- vex
+- duckdb-only
+engines:
+- duckdb
+description: >
+  In-filtering: push scalar WHERE predicates into graph search so low-selectivity
+  queries still return k matching neighbours (post-filter + oversample cannot).
+  Pre-filter (exact over the matching set) is used when |D_φ| ≤ max(4k, bft)
+  or |D_φ| ≤ compensated ef (exact is then cheaper than a wide graph walk).
+steps:
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- statement: SET ${GUC_EF_SEARCH} = 40;
+- statement: CREATE TABLE items (id INTEGER, vec ${VECTOR(2)}, category VARCHAR, year INTEGER, tag VARCHAR);
+- statement: |
+    INSERT INTO items
+    SELECT i,
+           list_value(i::FLOAT, 0.0::FLOAT)::${VECTOR(2)},
+           CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END,
+           2000 + (i % 5),
+           CASE WHEN i > 150 THEN 'keep' ELSE 'drop' END
+    FROM ${RANGE2(1, 201)} t(i);
+- statement: CREATE INDEX idx_items ON items USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+
+# Optimizer still rewrites filtered ANN to VEXDB_INDEX_SCAN and marks the predicate as pushed.
+- query: EXPLAIN SELECT id FROM items WHERE tag = 'keep' ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0], 2)})} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+
+# Killer case vs post-filter: neighbours of [0,0] are ids 1,2,3,... none of the
+# first 150 have tag='keep'. Pushed filter (pre- or in-) must return 151..155,
+# not an empty set.
+- query: SELECT id FROM items WHERE tag = 'keep' ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0], 2)})} LIMIT 5;
+  _field_types: I
+  expect:
+  - - 151
+  - - 152
+  - - 153
+  - - 154
+  - - 155
+
+# Wide predicate (even, 50%): in-filter returns a full k of even ids, not the
+# even subset of the unfiltered top-k.
+- query: SELECT id FROM items WHERE category = 'even' ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0], 2)})} LIMIT 10;
+  _field_types: I
+  expect:
+  - - 2
+  - - 4
+  - - 6
+  - - 8
+  - - 10
+  - - 12
+  - - 14
+  - - 16
+  - - 18
+  - - 20
+
+# AND of equality + range (even ∧ year=2003 → i ≡ 8 mod 10).
+- query: SELECT id FROM items WHERE category = 'even' AND year = 2003 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0], 2)})} LIMIT 3;
+  _field_types: I
+  expect:
+  - - 8
+  - - 18
+  - - 28
+
+# Narrow matching set (odd ∧ year=2001 → 20 rows ≤ 4k): pre-filter exact path.
+- query: SELECT id FROM items WHERE category = 'odd' AND year = 2001 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0], 2)})} LIMIT 10;
+  _field_types: I
+  expect:
+  - - 1
+  - - 11
+  - - 21
+  - - 31
+  - - 41
+  - - 51
+  - - 61
+  - - 71
+  - - 81
+  - - 91
+
+# No-hit short-circuit: empty bitset, do not walk the graph.
+- query: SELECT id FROM items WHERE category = 'nope' ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0], 2)})} LIMIT 5;
+  _field_types: I
+  expect: []
+
+# Unfiltered path is unchanged.
+- query: SELECT id FROM items ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0], 2)})} LIMIT 3;
+  _field_types: I
+  expect:
+  - - 1
+  - - 2
+  - - 3
+
+- statement: DROP TABLE items;

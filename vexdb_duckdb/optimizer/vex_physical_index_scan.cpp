@@ -8,11 +8,19 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+
+#include <algorithm>
+#include <unordered_set>
 
 namespace duckdb {
 
 static constexpr const char *kAlgorithmBruteForce = "brute-force";
 static constexpr const char *kAlgorithmHnsw = "hnsw";
+static constexpr const char *kAlgorithmInFilter = "in-filter";
+static constexpr const char *kAlgorithmPreFilter = "pre-filter";
 
 class VexIndexScanOperatorState : public OperatorState {
 public:
@@ -25,23 +33,35 @@ LogicalVexIndexScan::LogicalVexIndexScan(idx_t table_index_p, vector<LogicalType
                                          DuckTableEntry &table_p, GraphIndex &graph_index_p,
                                          unique_ptr<Expression> query_vec_expr_p, idx_t k_p,
                                          vector<ColumnIndex> column_ids_p, vector<idx_t> fetch_output_positions_p,
-                                         optional_idx distance_output_index_p, vector<LogicalType> returned_types_p)
+                                         optional_idx distance_output_index_p, vector<LogicalType> returned_types_p,
+                                         vector<unique_ptr<Expression>> filter_exprs_p)
     : table_index(table_index_p), output_types(std::move(output_types_p)), table(table_p),
       graph_index(graph_index_p), query_vec_expr(std::move(query_vec_expr_p)), k(k_p),
       column_ids(std::move(column_ids_p)), fetch_output_positions(std::move(fetch_output_positions_p)),
-      distance_output_index(distance_output_index_p), returned_types(std::move(returned_types_p)) {
+      distance_output_index(distance_output_index_p), returned_types(std::move(returned_types_p)),
+      filter_exprs(std::move(filter_exprs_p)) {
 }
 
 PhysicalOperator &LogicalVexIndexScan::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
+    vector<unique_ptr<Expression>> filter_copies;
+    filter_copies.reserve(filter_exprs.size());
+    for (auto &expr : filter_exprs) {
+        filter_copies.push_back(expr->Copy());
+    }
 	auto &scan = planner.Make<PhysicalVexIndexScan>(types, estimated_cardinality, table, graph_index,
 	                                                query_vec_expr->Copy(), k, column_ids, fetch_output_positions,
-	                                                distance_output_index, returned_types, output_types.size());
+	                                                distance_output_index, returned_types, output_types.size(),
+	                                                std::move(filter_copies));
     {
         auto bft = GetBruteForceThreshold(context);
         auto &phys_scan = scan.Cast<PhysicalVexIndexScan>();
-        phys_scan.algorithm_used = (static_cast<int64_t>(graph_index.GetNodeCount()) <= bft)
-                                       ? kAlgorithmBruteForce
-                                       : kAlgorithmHnsw;
+        if (!filter_exprs.empty()) {
+            phys_scan.algorithm_used = kAlgorithmInFilter;
+        } else {
+            phys_scan.algorithm_used = (static_cast<int64_t>(graph_index.GetNodeCount()) <= bft)
+                                           ? kAlgorithmBruteForce
+                                           : kAlgorithmHnsw;
+        }
     }
     if (children.empty()) {
         auto &dummy_scan = planner.Make<PhysicalDummyScan>(vector<LogicalType> {LogicalType::INTEGER}, 1);
@@ -59,7 +79,13 @@ void LogicalVexIndexScan::ResolveColumnBindings(ColumnBindingResolver &res, vect
         res.VisitOperator(*child);
     }
     res.VisitExpression(&query_vec_expr);
+    // Filter predicates refer to this scan's table columns, not the dummy child.
+    // Publish our bindings first so BoundColumnRef → BoundReference uses the
+    // column_ids layout that CollectMatchingRowIds later materializes.
     bindings = GetColumnBindings();
+    for (auto &expr : filter_exprs) {
+        res.VisitExpression(&expr);
+    }
 }
 
 string LogicalVexIndexScan::GetExtensionName() const {
@@ -99,12 +125,12 @@ PhysicalVexIndexScan::PhysicalVexIndexScan(PhysicalPlan &physical_plan, vector<L
 	                                           GraphIndex &graph_index_p, unique_ptr<Expression> query_vec_expr_p, idx_t k_p,
 	                                           vector<ColumnIndex> column_ids_p, vector<idx_t> fetch_output_positions_p,
 	                                           optional_idx distance_output_index_p, vector<LogicalType> returned_types_p,
-	                                           idx_t base_output_count_p)
+	                                           idx_t base_output_count_p, vector<unique_ptr<Expression>> filter_exprs_p)
 	: PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
 	  table(table_p), graph_index(graph_index_p), query_vec_expr(std::move(query_vec_expr_p)), k(k_p),
 	  column_ids(std::move(column_ids_p)), fetch_output_positions(std::move(fetch_output_positions_p)),
 	  distance_output_index(distance_output_index_p), returned_types(std::move(returned_types_p)),
-	  base_output_count(base_output_count_p) {
+	  base_output_count(base_output_count_p), filter_exprs(std::move(filter_exprs_p)) {
 }
 
 string PhysicalVexIndexScan::GetName() const {
@@ -117,6 +143,9 @@ InsertionOrderPreservingMap<string> PhysicalVexIndexScan::ParamsToString() const
     result["Top"] = to_string(k);
     if (!algorithm_used.empty()) {
         result["Algorithm"] = algorithm_used;
+    }
+    if (!filter_exprs.empty()) {
+        result["Filter"] = "pushed";
     }
     return result;
 }
@@ -153,6 +182,109 @@ static bool ExtractFloatVector(const Value &val, vector<float> &out_vec) {
         return ExtractFloatVectorFromChildren(ListValue::GetChildren(val), ListType::GetChildType(type).id(), out_vec);
     }
     return false;
+}
+
+// Evaluate pushed predicates against a table scan and collect matching row ids.
+// Filter expressions bind to LogicalGet column_ids indices, so the scan chunk
+// is laid out in the same order. NULL predicate results are treated as not matching.
+static void CollectMatchingRowIds(ClientContext &context, DuckTableEntry &duck_table,
+                                  const vector<ColumnIndex> &column_ids,
+                                  const vector<unique_ptr<Expression>> &filter_exprs,
+                                  unordered_set<row_t> &allowed, vector<row_t> &allowed_list) {
+    allowed.clear();
+    allowed_list.clear();
+    if (filter_exprs.empty()) {
+        return;
+    }
+
+    auto &storage = duck_table.GetStorage();
+    auto &db = duck_table.ParentCatalog().GetAttached();
+    auto &transaction = DuckTransaction::Get(context, db);
+    auto table_types = storage.GetTypes();
+
+    vector<StorageIndex> scan_column_ids;
+    vector<LogicalType> expr_types;
+    scan_column_ids.reserve(column_ids.size() + 1);
+    expr_types.reserve(column_ids.size());
+    for (idx_t i = 0; i < column_ids.size(); i++) {
+        if (column_ids[i].IsVirtualColumn()) {
+            scan_column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+            expr_types.emplace_back(LogicalType::ROW_TYPE);
+        } else {
+            auto phys = column_ids[i].GetPrimaryIndex();
+            if (phys >= table_types.size()) {
+                throw InternalException("VEX filter scan: physical column %llu out of range", phys);
+            }
+            scan_column_ids.emplace_back(phys);
+            expr_types.push_back(table_types[phys]);
+        }
+    }
+    const idx_t rowid_col = scan_column_ids.size();
+    scan_column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+
+    vector<LogicalType> scan_types = expr_types;
+    scan_types.push_back(LogicalType::ROW_TYPE);
+
+    TableScanState scan_state;
+    storage.InitializeScan(context, transaction, scan_state, scan_column_ids);
+
+    DataChunk chunk;
+    chunk.Initialize(Allocator::Get(context), scan_types);
+
+    vector<unique_ptr<ExpressionExecutor>> executors;
+    executors.reserve(filter_exprs.size());
+    for (auto &expr : filter_exprs) {
+        executors.push_back(make_uniq<ExpressionExecutor>(context, *expr));
+    }
+
+    while (true) {
+        chunk.Reset();
+        storage.Scan(transaction, chunk, scan_state);
+        if (chunk.size() == 0) {
+            break;
+        }
+
+        DataChunk expr_chunk;
+        expr_chunk.InitializeEmpty(expr_types);
+        for (idx_t c = 0; c < expr_types.size(); c++) {
+            expr_chunk.data[c].Reference(chunk.data[c]);
+        }
+        expr_chunk.SetCardinality(chunk.size());
+
+        vector<bool> pass(chunk.size(), true);
+        for (auto &executor : executors) {
+            executor->SetChunk(expr_chunk);
+            Vector result(LogicalType::BOOLEAN);
+            executor->ExecuteExpression(result);
+            result.Flatten(chunk.size());
+            auto *data = FlatVector::GetData<bool>(result);
+            auto &validity = FlatVector::Validity(result);
+            for (idx_t i = 0; i < chunk.size(); i++) {
+                if (!pass[i]) {
+                    continue;
+                }
+                if (!validity.RowIsValid(i) || !data[i]) {
+                    pass[i] = false;
+                }
+            }
+        }
+
+        chunk.data[rowid_col].Flatten(chunk.size());
+        auto *row_ids = FlatVector::GetData<row_t>(chunk.data[rowid_col]);
+        auto &row_validity = FlatVector::Validity(chunk.data[rowid_col]);
+        for (idx_t i = 0; i < chunk.size(); i++) {
+            if (!pass[i] || !row_validity.RowIsValid(i)) {
+                continue;
+            }
+            auto rid = row_ids[i];
+            if (rid < 0 || rid >= MAX_ROW_ID) {
+                continue;
+            }
+            if (allowed.insert(rid).second) {
+                allowed_list.push_back(rid);
+            }
+        }
+    }
 }
 
 OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
@@ -220,10 +352,59 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
             pq_only = true;
         }
 
+        unordered_set<row_t> allowed;
+        vector<row_t> allowed_list;
+        GraphIndex::RowFilter row_filter;
+        bool use_prefilter = false;
+        if (!filter_exprs.empty()) {
+            CollectMatchingRowIds(context.client, table, column_ids, filter_exprs, allowed, allowed_list);
+            if (allowed.empty()) {
+                scan_state.collection = make_uniq<ColumnDataCollection>(context.client, types);
+                scan_state.collection->InitializeScan(scan_state.scan_state);
+                scan_state.searched = true;
+                chunk.Reset();
+                return OperatorResultType::FINISHED;
+            }
+            // Matching-set brute cutoff: max(4k, table-level bft). bft=0 is a
+            // debug knob to force ANN on the full table; the 4k floor still
+            // exact-scans tiny predicate sets (SQLite M7').
+            const idx_t match_brute = MaxValue<idx_t>(
+                k * 4, static_cast<idx_t>(std::max<int64_t>(0, GetBruteForceThreshold(context.client))));
+            const bool can_exact = !pq_only && !graph_index.UsesRaBitQ() && !graph_index.IsCompactMode();
+            use_prefilter = can_exact && allowed_list.size() <= match_brute;
+            if (!use_prefilter) {
+                // Selectivity compensation: lower pass rate ⇒ more wasted graph
+                // visits. Scale ef by N/|D_φ|, capped at 10× (SQLite M7' policy).
+                const idx_t nlive = MaxValue<idx_t>(graph_index.GetRowIdCount(), 1);
+                const double sel = static_cast<double>(nlive) / static_cast<double>(allowed.size());
+                const double base_ef = static_cast<double>(MaxValue<idx_t>(k, static_cast<idx_t>(ef)));
+                ef = static_cast<int>(base_ef * std::min(10.0, std::max(1.0, sel)));
+                if (ef < 1) {
+                    ef = 1;
+                }
+                if (ef > 65535) {
+                    ef = 65535;
+                }
+                // If the matching set is no larger than the search width, exact
+                // ranking is cheaper than a graph walk and is stable on
+                // low-correlation predicates (tag='keep' vs query [0,0]).
+                if (can_exact && allowed_list.size() <= static_cast<idx_t>(ef)) {
+                    use_prefilter = true;
+                } else {
+                    row_filter = [&allowed](row_t rid) { return allowed.find(rid) != allowed.end(); };
+                }
+            }
+            algorithm_used = use_prefilter ? kAlgorithmPreFilter : kAlgorithmInFilter;
+        }
+
         vector<row_t> result_row_ids;
         vector<float> result_distances;
-        if (graph_index.UsesRaBitQ()) {
-            graph_index.SearchRaBitQ(query_vec.data(), k, ef, result_row_ids, result_distances);
+        if (use_prefilter) {
+            graph_index.SearchExactOverRows(query_vec.data(), k, allowed_list, result_row_ids,
+                                            result_distances);
+        } else if (graph_index.UsesRaBitQ()) {
+            graph_index.SearchRaBitQ(query_vec.data(), k, ef, result_row_ids, result_distances,
+                                     row_filter);
         } else if (pq_only) {
             if (!graph_index.UsesPQ()) {
                 throw InvalidInputException(
@@ -239,9 +420,9 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                 }
             }
             graph_index.SearchPQ(query_vec.data(), k, ef, result_row_ids, result_distances,
-                                 refine_factor);
+                                 refine_factor, row_filter);
         } else {
-            graph_index.SearchANN(query_vec.data(), k, ef, result_row_ids, result_distances);
+            graph_index.SearchANN(query_vec.data(), k, ef, result_row_ids, result_distances, row_filter);
         }
 
         auto fetch_types = BuildOutputTypes(column_ids, returned_types);
